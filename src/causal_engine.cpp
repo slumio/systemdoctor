@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <unistd.h>
+#include <fstream>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -64,7 +66,47 @@ std::unordered_map<pid_t, GraphNode> CausalGraph::take_proc_snapshot() {
     return snapshot;
 }
 
-void CausalGraph::build_graph(int interval_seconds) {
+void CausalGraph::build_graph(int interval_seconds, bool use_ebpf, pid_t target_pid) {
+    // Check and initialize eBPF tracing if requested
+    bool ebpf_running = false;
+    std::string bpftrace_log = "/tmp/syspilot_bpftrace.log";
+    if (use_ebpf && target_pid > 0) {
+        std::string bpftrace_cmd = "bpftrace";
+        bool has_privileges = false;
+        if (getuid() == 0) {
+            has_privileges = true;
+        } else if (std::system("sudo -n true 2>/dev/null") == 0) {
+            has_privileges = true;
+            bpftrace_cmd = "sudo bpftrace";
+        }
+        
+        if (has_privileges) {
+            // Clean up old log
+            std::error_code ec;
+            std::filesystem::remove(bpftrace_log, ec);
+            
+            std::string filter = "pid == " + std::to_string(target_pid) + " || ppid == " + std::to_string(target_pid);
+            
+            std::string script = 
+                "tracepoint:syscalls:sys_enter_open,tracepoint:syscalls:sys_enter_openat /" + filter + "/ { "
+                "  printf(\"OPEN | %d | %s | %s\\n\", pid, comm, str(args->filename)); "
+                "} "
+                "tracepoint:syscalls:sys_enter_connect /" + filter + "/ { "
+                "  printf(\"CONNECT | %d | %s | family: %d\\n\", pid, comm, args->uservaddr->sa_family); "
+                "} "
+                "tracepoint:syscalls:sys_enter_execve /" + filter + "/ { "
+                "  printf(\"EXEC | %d | %s | %s\\n\", pid, comm, str(args->filename)); "
+                "}";
+                
+            std::string cmd = "timeout " + std::to_string(interval_seconds) + " " + bpftrace_cmd + " -e '" + script + "' > " + bpftrace_log + " 2>/dev/null &";
+            utils::run_command_output(cmd);
+            ebpf_running = true;
+            std::cout << "🚀 [eBPF] Active tracing enabled for PID " << target_pid << "..." << std::endl;
+        } else {
+            std::cout << "⚠️  [eBPF] Insufficient privileges. Falling back to standard procfs polling..." << std::endl;
+        }
+    }
+
     // 1. Take Snapshot 1
     std::unordered_map<pid_t, GraphNode> snap1 = take_proc_snapshot();
     std::unordered_map<std::string, uint64_t> disk1 = telemetry::get_disk_stats();
@@ -309,6 +351,87 @@ void CausalGraph::build_graph(int interval_seconds) {
             }
         }
     }
+
+    // 7. Parse eBPF Tracing Log if enabled and run
+    if (ebpf_running) {
+        // Sleep briefly to let the log write flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        
+        std::ifstream file(bpftrace_log);
+        if (file.is_open()) {
+            std::string line;
+            while (std::getline(file, line)) {
+                if (line.empty()) continue;
+                
+                std::vector<std::string> parts = utils::split(line, " | ");
+                if (parts.size() >= 4) {
+                    std::string event_type = utils::trim(parts[0]);
+                    pid_t event_pid = 0;
+                    try {
+                        event_pid = std::stoi(utils::trim(parts[1]));
+                    } catch (...) { continue; }
+                    
+                    std::string comm = utils::trim(parts[2]);
+                    std::string details = utils::trim(parts[3]);
+                    
+                    std::string pnode_id = "pid:" + std::to_string(event_pid);
+                    
+                    // Ensure process node exists
+                    if (nodes.find(pnode_id) == nodes.end()) {
+                        GraphNode pnode;
+                        pnode.id = pnode_id;
+                        pnode.pid = event_pid;
+                        pnode.name = comm;
+                        pnode.type = NodeType::PROCESS;
+                        pnode.state = "S";
+                        pnode.cpu_usage_pct = 0.0;
+                        pnode.read_rate_kb = 0.0;
+                        pnode.write_rate_kb = 0.0;
+                        add_node(pnode);
+                    }
+                    
+                    if (event_type == "OPEN" || event_type == "OPENAT") {
+                        std::string res_id = "resource:" + details;
+                        if (nodes.find(res_id) == nodes.end()) {
+                            GraphNode rnode;
+                            rnode.id = res_id;
+                            rnode.name = details;
+                            rnode.type = NodeType::RESOURCE;
+                            add_node(rnode);
+                        }
+                        // Connect process to resource
+                        add_edge(pnode_id, res_id, EdgeType::READS_FROM, "eBPF trace: opened file");
+                    } 
+                    else if (event_type == "CONNECT") {
+                        std::string res_id = "resource:socket_" + details;
+                        if (nodes.find(res_id) == nodes.end()) {
+                            GraphNode rnode;
+                            rnode.id = res_id;
+                            rnode.name = "Socket (" + details + ")";
+                            rnode.type = NodeType::RESOURCE;
+                            add_node(rnode);
+                        }
+                        add_edge(pnode_id, res_id, EdgeType::READS_FROM, "eBPF trace: network connection");
+                    }
+                    else if (event_type == "EXEC") {
+                        std::string res_id = "resource:" + details;
+                        if (nodes.find(res_id) == nodes.end()) {
+                            GraphNode rnode;
+                            rnode.id = res_id;
+                            rnode.name = details;
+                            rnode.type = NodeType::RESOURCE;
+                            add_node(rnode);
+                        }
+                        add_edge(pnode_id, res_id, EdgeType::READS_FROM, "eBPF trace: executed binary");
+                    }
+                }
+            }
+            file.close();
+        }
+        // Clean up the log file
+        std::error_code ec;
+        std::filesystem::remove(bpftrace_log, ec);
+    }
 }
 
 std::vector<std::string> CausalGraph::trace_root_cause(const std::string& start_node_id) {
@@ -456,4 +579,293 @@ std::string CausalGraph::serialize_chain_to_json(const std::vector<std::string>&
     j["edges"] = j_edges;
     
     return j.dump(4);
+}
+
+std::string CausalGraph::export_graph_to_dot(const std::vector<std::string>& path_nodes) {
+    std::unordered_set<std::string> path_set(path_nodes.begin(), path_nodes.end());
+    std::ostringstream oss;
+    oss << "digraph CausalTrace {\n";
+    oss << "    // Graph styling\n";
+    oss << "    backgroundcolor=\"#0f172a\";\n";
+    oss << "    node [style=\"filled,rounded\", shape=box, fontname=\"Helvetica,Arial,sans-serif\", fontsize=10, penwidth=1.5];\n";
+    oss << "    edge [fontname=\"Helvetica,Arial,sans-serif\", fontsize=8, color=\"#94a3b8\", fontcolor=\"#cbd5e1\", penwidth=1.5];\n\n";
+
+    // Write nodes
+    for (const auto& node_id : path_nodes) {
+        auto it = nodes.find(node_id);
+        if (it != nodes.end()) {
+            std::string label = it->second.name;
+            if (it->second.type == NodeType::PROCESS) {
+                label += " (PID: " + std::to_string(it->second.pid) + ")";
+                if (it->second.read_rate_kb > 0.1 || it->second.write_rate_kb > 0.1) {
+                    label += "\\nI/O: R " + std::to_string((int)it->second.read_rate_kb) + "KB/s, W " + std::to_string((int)it->second.write_rate_kb) + "KB/s";
+                }
+            } else {
+                label = "[Resource]\\n" + label;
+            }
+
+            std::string fillColor = "#1e293b";
+            std::string strokeColor = "#475569";
+            std::string fontColor = "#f8fafc";
+
+            if (it->second.is_anomalous) {
+                fillColor = "#7f1d1d";
+                strokeColor = "#ef4444";
+            } else if (it->second.type == NodeType::RESOURCE) {
+                fillColor = "#0f172a";
+                strokeColor = "#334155";
+            } else {
+                fillColor = "#0284c7";
+                strokeColor = "#38bdf8";
+            }
+
+            oss << "    \"" << node_id << "\" [label=\"" << label 
+                << "\", fillcolor=\"" << fillColor 
+                << "\", color=\"" << strokeColor 
+                << "\", fontcolor=\"" << fontColor << "\"];\n";
+        }
+    }
+    oss << "\n";
+
+    // Write edges
+    for (const auto& edge : edges) {
+        if (path_set.find(edge.from_id) != path_set.end() && path_set.find(edge.to_id) != path_set.end()) {
+            std::string type_str = "ACCESS";
+            std::string color = "#64748b";
+            switch (edge.type) {
+                case EdgeType::SPAWNED_BY: 
+                    type_str = "SPAWNED_BY"; 
+                    color = "#475569"; 
+                    break;
+                case EdgeType::READS_FROM: 
+                    type_str = "READS_FROM"; 
+                    color = "#38bdf8"; 
+                    break;
+                case EdgeType::WRITES_TO: 
+                    type_str = "WRITES_TO"; 
+                    color = "#f97316";
+                    break;
+                case EdgeType::BLOCKED_ON: 
+                    type_str = "BLOCKED_ON"; 
+                    color = "#ef4444";
+                    break;
+                case EdgeType::CONTENDS_WITH: 
+                    type_str = "CONTENDS_WITH"; 
+                    color = "#eab308";
+                    break;
+            }
+            std::string label = type_str;
+            if (!edge.details.empty()) {
+                label += " (" + edge.details + ")";
+            }
+            
+            size_t pos = 0;
+            while ((pos = label.find('"', pos)) != std::string::npos) {
+                label.replace(pos, 1, "'");
+                pos++;
+            }
+            
+            oss << "    \"" << edge.from_id << "\" -> \"" << edge.to_id 
+                << "\" [label=\"" << label << "\", color=\"" << color << "\"];\n";
+        }
+    }
+
+    oss << "}\n";
+    return oss.str();
+}
+
+std::string CausalGraph::export_graph_to_mermaid(const std::vector<std::string>& path_nodes) {
+    std::unordered_set<std::string> path_set(path_nodes.begin(), path_nodes.end());
+    std::ostringstream oss;
+    oss << "graph TD\n";
+    oss << "    classDef process fill:#0284c7,stroke:#38bdf8,color:#fff,stroke-width:2px;\n";
+    oss << "    classDef resource fill:#1e293b,stroke:#475569,color:#cbd5e1,stroke-width:2px;\n";
+    oss << "    classDef anomalous fill:#7f1d1d,stroke:#ef4444,color:#fff,stroke-width:2px;\n\n";
+
+    for (const auto& node_id : path_nodes) {
+        auto it = nodes.find(node_id);
+        if (it != nodes.end()) {
+            std::string label = it->second.name;
+            if (it->second.type == NodeType::PROCESS) {
+                label += " (PID: " + std::to_string(it->second.pid) + ")";
+                if (it->second.read_rate_kb > 0.1 || it->second.write_rate_kb > 0.1) {
+                    label += " [IO: R " + std::to_string((int)it->second.read_rate_kb) + "KB/s, W " + std::to_string((int)it->second.write_rate_kb) + "KB/s]";
+                }
+            } else {
+                label = "[Resource] " + label;
+            }
+            
+            std::string clean_label = label;
+            size_t pos = 0;
+            while ((pos = clean_label.find('"', pos)) != std::string::npos) {
+                clean_label.replace(pos, 1, "'");
+                pos++;
+            }
+            
+            std::string safe_node_id = node_id;
+            std::replace(safe_node_id.begin(), safe_node_id.end(), ':', '_');
+            std::replace(safe_node_id.begin(), safe_node_id.end(), '/', '_');
+            std::replace(safe_node_id.begin(), safe_node_id.end(), '.', '_');
+            std::replace(safe_node_id.begin(), safe_node_id.end(), '[', '_');
+            std::replace(safe_node_id.begin(), safe_node_id.end(), ']', '_');
+            std::replace(safe_node_id.begin(), safe_node_id.end(), ' ', '_');
+
+            oss << "    " << safe_node_id << "[\"" << clean_label << "\"]\n";
+            
+            if (it->second.is_anomalous) {
+                oss << "    class " << safe_node_id << " anomalous;\n";
+            } else if (it->second.type == NodeType::RESOURCE) {
+                oss << "    class " << safe_node_id << " resource;\n";
+            } else {
+                oss << "    class " << safe_node_id << " process;\n";
+            }
+        }
+    }
+    oss << "\n";
+
+    for (const auto& edge : edges) {
+        if (path_set.find(edge.from_id) != path_set.end() && path_set.find(edge.to_id) != path_set.end()) {
+            std::string type_str = "ACCESS";
+            switch (edge.type) {
+                case EdgeType::SPAWNED_BY: type_str = "SPAWNED_BY"; break;
+                case EdgeType::READS_FROM: type_str = "READS_FROM"; break;
+                case EdgeType::WRITES_TO: type_str = "WRITES_TO"; break;
+                case EdgeType::BLOCKED_ON: type_str = "BLOCKED_ON"; break;
+                case EdgeType::CONTENDS_WITH: type_str = "CONTENDS_WITH"; break;
+            }
+            std::string label = type_str;
+            if (!edge.details.empty()) {
+                label += " (" + edge.details + ")";
+            }
+            
+            size_t pos = 0;
+            while ((pos = label.find('"', pos)) != std::string::npos) {
+                label.replace(pos, 1, "'");
+                pos++;
+            }
+
+            std::string safe_from = edge.from_id;
+            std::replace(safe_from.begin(), safe_from.end(), ':', '_');
+            std::replace(safe_from.begin(), safe_from.end(), '/', '_');
+            std::replace(safe_from.begin(), safe_from.end(), '.', '_');
+            std::replace(safe_from.begin(), safe_from.end(), '[', '_');
+            std::replace(safe_from.begin(), safe_from.end(), ']', '_');
+            std::replace(safe_from.begin(), safe_from.end(), ' ', '_');
+
+            std::string safe_to = edge.to_id;
+            std::replace(safe_to.begin(), safe_to.end(), ':', '_');
+            std::replace(safe_to.begin(), safe_to.end(), '/', '_');
+            std::replace(safe_to.begin(), safe_to.end(), '.', '_');
+            std::replace(safe_to.begin(), safe_to.end(), '[', '_');
+            std::replace(safe_to.begin(), safe_to.end(), ']', '_');
+            std::replace(safe_to.begin(), safe_to.end(), ' ', '_');
+
+            oss << "    " << safe_from << " -->|\"" << label << "\"| " << safe_to << "\n";
+        }
+    }
+
+    return oss.str();
+}
+
+std::string CausalGraph::export_graph_to_html(const std::vector<std::string>& path_nodes) {
+    std::string mermaid_code = export_graph_to_mermaid(path_nodes);
+    
+    std::string symptom_desc = "Unknown Target";
+    if (!path_nodes.empty()) {
+        auto it = nodes.find(path_nodes.front());
+        if (it != nodes.end()) {
+            symptom_desc = it->second.name;
+            if (it->second.type == NodeType::PROCESS) {
+                symptom_desc += " (PID " + std::to_string(it->second.pid) + ")";
+            }
+        }
+    }
+
+    std::ostringstream oss;
+    oss << "<!DOCTYPE html>\n";
+    oss << "<html lang=\"en\">\n";
+    oss << "<head>\n";
+    oss << "    <meta charset=\"utf-8\">\n";
+    oss << "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
+    oss << "    <title>SysPilot CausalTrace Graph</title>\n";
+    oss << "    <script type=\"module\">\n";
+    oss << "        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';\n";
+    oss << "        mermaid.initialize({\n";
+    oss << "            startOnLoad: true,\n";
+    oss << "            theme: 'dark',\n";
+    oss << "            securityLevel: 'loose'\n";
+    oss << "        });\n";
+    oss << "    </script>\n";
+    oss << "    <style>\n";
+    oss << "        body {\n";
+    oss << "            font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif;\n";
+    oss << "            margin: 0;\n";
+    oss << "            padding: 2rem;\n";
+    oss << "            background: #0b0f19;\n";
+    oss << "            color: #f1f5f9;\n";
+    oss << "        }\n";
+    oss << "        .container {\n";
+    oss << "            max-width: 1000px;\n";
+    oss << "            margin: 0 auto;\n";
+    oss << "        }\n";
+    oss << "        header {\n";
+    oss << "            margin-bottom: 2rem;\n";
+    oss << "            border-bottom: 1px solid #1e293b;\n";
+    oss << "            padding-bottom: 1rem;\n";
+    oss << "        }\n";
+    oss << "        h1 {\n";
+    oss << "            font-size: 1.75rem;\n";
+    oss << "            font-weight: 700;\n";
+    oss << "            color: #38bdf8;\n";
+    oss << "            margin: 0 0 0.5rem 0;\n";
+    oss << "        }\n";
+    oss << "        .subtitle {\n";
+    oss << "            color: #94a3b8;\n";
+    oss << "            font-size: 0.95rem;\n";
+    oss << "            margin: 0;\n";
+    oss << "        }\n";
+    oss << "        .symptom-tag {\n";
+    oss << "            background: #0369a1;\n";
+    oss << "            color: #e0f2fe;\n";
+    oss << "            padding: 0.15rem 0.5rem;\n";
+    oss << "            border-radius: 0.25rem;\n";
+    oss << "            font-weight: 600;\n";
+    oss << "            font-family: monospace;\n";
+    oss << "        }\n";
+    oss << "        .graph-wrapper {\n";
+    oss << "            background: #111827;\n";
+    oss << "            border: 1px solid #1f2937;\n";
+    oss << "            border-radius: 0.75rem;\n";
+    oss << "            padding: 2rem;\n";
+    oss << "            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);\n";
+    oss << "            overflow-x: auto;\n";
+    oss << "            display: flex;\n";
+    oss << "            justify-content: center;\n";
+    oss << "        }\n";
+    oss << "        footer {\n";
+    oss << "            margin-top: 2rem;\n";
+    oss << "            text-align: center;\n";
+    oss << "            font-size: 0.8rem;\n";
+    oss << "            color: #4b5563;\n";
+    oss << "        }\n";
+    oss << "    </style>\n";
+    oss << "</head>\n";
+    oss << "<body>\n";
+    oss << "    <div class=\"container\">\n";
+    oss << "        <header>\n";
+    oss << "            <h1>🌐 SysPilot CausalTrace</h1>\n";
+    oss << "            <p class=\"subtitle\">Causal Dependency Diagnostics for Symptom: <span class=\"symptom-tag\">" << symptom_desc << "</span></p>\n";
+    oss << "        </header>\n";
+    oss << "        <main class=\"graph-wrapper\">\n";
+    oss << "            <pre class=\"mermaid\">\n";
+    oss << mermaid_code << "\n";
+    oss << "            </pre>\n";
+    oss << "        </main>\n";
+    oss << "        <footer>\n";
+    oss << "            Generated automatically by SysPilot &bull; Kernel-Level Causal Observability Engine\n";
+    oss << "        </footer>\n";
+    oss << "    </div>\n";
+    oss << "</body>\n";
+    oss << "</html>\n";
+    return oss.str();
 }

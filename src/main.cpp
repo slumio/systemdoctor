@@ -17,6 +17,7 @@
 #include <fstream>
 #include <algorithm>
 #include <unistd.h>
+#include <ctime>
 
 using json = nlohmann::json;
 
@@ -377,7 +378,7 @@ int main(int argc, char* argv[]) {
             if (causal) {
                 std::cout << "🌐 Constructing real-time Causal Dependency Graph (CausalTrace)..." << std::endl;
                 CausalGraph graph;
-                graph.build_graph(2); // 2-second snapshot window
+                graph.build_graph(2, ebpf, pid); // 2-second snapshot window
                 
                 std::string target_node_id = "pid:" + std::to_string(pid);
                 std::cout << "🔍 Tracing root causes starting from " << target_pid_or_name << " (" << target_node_id << ")..." << std::endl;
@@ -389,6 +390,32 @@ int main(int argc, char* argv[]) {
                 ctx["analysis_type"] = "causal_inference_diagnostics";
                 ctx["target_process"] = target_pid_or_name;
                 ctx["target_pid"] = pid;
+
+                // Create directory for graph visual reports (non-hidden so snap-confined browsers can access it)
+                const char* home_env = std::getenv("HOME");
+                std::string reports_dir = (home_env ? std::string(home_env) : ".") + "/syspilot_reports";
+                utils::run_command_output("mkdir -p " + reports_dir);
+                
+                // Write DOT and HTML reports
+                std::string ts = std::to_string(std::time(nullptr));
+                std::string dot_path = reports_dir + "/causal_graph_" + ts + ".dot";
+                std::string html_path = reports_dir + "/causal_graph_" + ts + ".html";
+                
+                std::ofstream dot_file(dot_path);
+                if (dot_file.is_open()) {
+                    dot_file << graph.export_graph_to_dot(path);
+                    dot_file.close();
+                }
+                
+                std::ofstream html_file(html_path);
+                if (html_file.is_open()) {
+                    html_file << graph.export_graph_to_html(path);
+                    html_file.close();
+                }
+                
+                std::cout << "💾 Saved causal dependency graph to:" << std::endl;
+                std::cout << "   - DOT format:  " << dot_path << std::endl;
+                std::cout << "   - HTML format: " << html_path << "\n" << std::endl;
                 
                 if (!no_index) {
                     std::cout << "🔍 Mapping causal nodes back to codebase..." << std::endl;

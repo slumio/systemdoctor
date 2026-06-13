@@ -73,7 +73,11 @@ $ syspilot explain
 ### Causal Diagnostics: `syspilot explain --pid <PID> --causal`
 Diagnose execution stalls, resource blockages, and I/O contention using the **CausalTrace** engine. It builds a dependency graph, finds anomalous processes, and traces the exact causal chain:
 ```bash
+# Standard procfs telemetry collection
 $ syspilot explain --pid 4582 --causal
+
+# Real-time eBPF event-driven tracing (falls back to procfs if bpftrace is not available)
+$ sudo syspilot explain --pid 4582 --causal --ebpf
 ```
 *Note: Use `--no-index` if you want to bypass local codebase context mapping.*
 

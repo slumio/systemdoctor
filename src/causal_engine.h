@@ -47,14 +47,19 @@ public:
     std::unordered_map<std::string, GraphNode> nodes;
     std::vector<GraphEdge> edges;
 
-    // Populates graph based on two proc snapshots separated by interval
-    void build_graph(int interval_seconds = 2);
+    // Populates graph based on two proc snapshots separated by interval (with optional eBPF tracing)
+    void build_graph(int interval_seconds = 2, bool use_ebpf = false, pid_t target_pid = 0);
 
     // Runs reverse BFS from symptomatic node and returns a list of node IDs on the path
     std::vector<std::string> trace_root_cause(const std::string& start_node_id);
 
     // Serializes the causal graph segment (nodes and edges along path) to JSON string
     std::string serialize_chain_to_json(const std::vector<std::string>& path_nodes);
+
+    // Export formats
+    std::string export_graph_to_dot(const std::vector<std::string>& path_nodes);
+    std::string export_graph_to_mermaid(const std::vector<std::string>& path_nodes);
+    std::string export_graph_to_html(const std::vector<std::string>& path_nodes);
 
 private:
     void add_node(const GraphNode& node);
