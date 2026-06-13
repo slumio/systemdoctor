@@ -165,7 +165,7 @@ std::string run_command_output(const std::string& cmd, int* exit_code) {
     std::string result;
     // Redirect stderr to stdout so we capture it as well
     std::string cmd_with_stderr = cmd + " 2>&1";
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd_with_stderr.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd_with_stderr.c_str(), "r"), pclose);
     if (!pipe) {
         if (exit_code) *exit_code = -1;
         return "Failed to start process";

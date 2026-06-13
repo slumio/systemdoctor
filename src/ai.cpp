@@ -88,7 +88,7 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
     
     std::string cmd = "curl -s -N -X POST " + headers + " -d @" + temp_payload_path + " \"" + url + "\"";
     
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
         std::cerr << "❌ Failed to start curl process." << std::endl;
         utils::delete_file(temp_payload_path);
@@ -188,7 +188,7 @@ bool pull_ollama_model(const Config& config, const std::string& model_name) {
     
     std::cout << "⬇️ Pulling model '" << model_name << "'..." << std::endl;
     
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
         std::cerr << "❌ Failed to start curl process." << std::endl;
         utils::delete_file(temp_payload_path);
