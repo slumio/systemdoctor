@@ -1,0 +1,32 @@
+name: SysPilot CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Build Essentials
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential g++
+
+    - name: Compile SysPilot
+      run: |
+        chmod +x ./build.sh
+        ./build.sh
+
+    - name: Verify Build Output
+      run: |
+        if [ ! -f ./syspilot ]; then
+          echo "Error: syspilot binary not found!"
+          exit 1
+        fi
+        echo "✓ SysPilot successfully compiled."

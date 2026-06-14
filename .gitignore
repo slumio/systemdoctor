@@ -1,4 +1,32 @@
+# C++ Build Artifacts
+syspilot
+*.o
+*.obj
+*.out
+
+# Rust Legacy Build Artifacts
 /target/
 Cargo.lock
 **/*.rs.bk
+
+# Local Configuration and Logs
 .syspilot/
+*.log
+/tmp/syspilot_shared.log
+/tmp/syspilot_demo.pid
+
+# External Binaries and Tools
+bin/
+
+# Temporary / Generated Reports
+demo_report.html
+demo_split.html
+*.dot
+
+# Demo Executables
+language_server
+mock_db
+mock_backup
+
+# OS files
+.DS_Store
