@@ -33,9 +33,9 @@ const std::string REASONING_SYSTEM_PROMPT =
     "4. Keep explanations concise, clear, and highly technical.";
 
 bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer& streamer) {
-    std::string temp_payload_path = utils::get_syspilot_directory() + "/temp_ai_req.json";
     std::string url = "";
-    std::string headers = "-H \"Content-Type: application/json\"";
+    std::vector<std::string> headers;
+    std::string payload = "";
     
     if (config.active_provider == "gemini") {
         if (config.gemini_api_key.empty()) {
@@ -47,8 +47,7 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
         json jreq;
         jreq["contents"] = json::array({ {{"parts", json::array({ {{"text", prompt}} })}} });
         jreq["systemInstruction"] = {{"parts", json::array({ {{"text", REASONING_SYSTEM_PROMPT}} })}};
-        
-        utils::write_file_content(temp_payload_path, jreq.dump());
+        payload = jreq.dump();
     } 
     else if (config.active_provider == "ollama") {
         url = config.ollama_url + "/api/chat";
@@ -60,8 +59,7 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
             {{"role", "user"}, {"content", prompt}}
         });
         jreq["stream"] = true;
-        
-        utils::write_file_content(temp_payload_path, jreq.dump());
+        payload = jreq.dump();
     }
     else if (config.active_provider == "syspilot") {
         if (config.syspilot_api_key.empty()) {
@@ -69,7 +67,7 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
             return false;
         }
         url = "https://api.syspilot.dev/v1/chat/completions";
-        headers += " -H \"Authorization: Bearer " + config.syspilot_api_key + "\"";
+        headers.push_back("Authorization: Bearer " + config.syspilot_api_key);
         
         json jreq;
         jreq["model"] = config.syspilot_model;
@@ -78,29 +76,29 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
             {{"role", "user"}, {"content", prompt}}
         });
         jreq["stream"] = true;
-        
-        utils::write_file_content(temp_payload_path, jreq.dump());
+        payload = jreq.dump();
     }
     else {
         std::cerr << "❌ Unknown AI provider: " << config.active_provider << std::endl;
         return false;
     }
     
-    std::string cmd = "curl -s -N -X POST " + headers + " -d @" + temp_payload_path + " \"" + url + "\"";
-    
-    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) {
-        std::cerr << "❌ Failed to start curl process." << std::endl;
-        utils::delete_file(temp_payload_path);
-        return false;
+    // Construct command line arguments securely
+    std::vector<std::string> curl_args = {
+        "curl", "-s", "-N", "-X", "POST",
+        "-H", "Content-Type: application/json"
+    };
+    for (const auto& h : headers) {
+        curl_args.push_back("-H");
+        curl_args.push_back(h);
     }
+    curl_args.push_back("-d");
+    curl_args.push_back("@-"); // Read payload from stdin
+    curl_args.push_back(url);
     
-    std::array<char, 1024> buffer;
     std::string line_buffer = "";
-    
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        line_buffer += buffer.data();
-        
+    auto stream_cb = [&](const std::string& chunk) {
+        line_buffer += chunk;
         size_t newline_pos = 0;
         while ((newline_pos = line_buffer.find('\n')) != std::string::npos) {
             std::string line = utils::trim(line_buffer.substr(0, newline_pos));
@@ -152,9 +150,16 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
                 }
             }
         }
+    };
+    
+    int exit_code = 0;
+    bool success = utils::run_command_secure_stream(curl_args, payload, stream_cb, &exit_code);
+    
+    if (!success || exit_code != 0) {
+        std::cerr << "❌ Secure curl invocation failed with exit code: " << exit_code << std::endl;
+        return false;
     }
     
-    // Print remainder if any
     if (!line_buffer.empty()) {
         std::string line = utils::trim(line_buffer);
         if (config.active_provider == "ollama") {
@@ -169,38 +174,29 @@ bool query_ai_stream(const Config& config, const std::string& prompt, MdStreamer
     
     streamer.flush();
     std::cout << std::endl;
-    
-    utils::delete_file(temp_payload_path);
     return true;
 }
 
 bool pull_ollama_model(const Config& config, const std::string& model_name) {
-    std::string temp_payload_path = utils::get_syspilot_directory() + "/temp_pull_req.json";
-    
     json jreq;
     jreq["name"] = model_name;
     jreq["stream"] = true;
-    
-    utils::write_file_content(temp_payload_path, jreq.dump());
+    std::string payload = jreq.dump();
     
     std::string url = config.ollama_url + "/api/pull";
-    std::string cmd = "curl -s -N -X POST -H \"Content-Type: application/json\" -d @" + temp_payload_path + " \"" + url + "\"";
     
     std::cout << "⬇️ Pulling model '" << model_name << "'..." << std::endl;
     
-    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) {
-        std::cerr << "❌ Failed to start curl process." << std::endl;
-        utils::delete_file(temp_payload_path);
-        return false;
-    }
+    std::vector<std::string> curl_args = {
+        "curl", "-s", "-N", "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "-d", "@-",
+        url
+    };
     
-    std::array<char, 512> buffer;
     std::string line_buffer = "";
-    
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        line_buffer += buffer.data();
-        
+    auto stream_cb = [&](const std::string& chunk) {
+        line_buffer += chunk;
         size_t newline_pos = 0;
         while ((newline_pos = line_buffer.find('\n')) != std::string::npos) {
             std::string line = utils::trim(line_buffer.substr(0, newline_pos));
@@ -231,10 +227,16 @@ bool pull_ollama_model(const Config& config, const std::string& model_name) {
                 }
             } catch (...) {}
         }
-    }
-    std::cout << std::endl;
+    };
     
-    utils::delete_file(temp_payload_path);
+    int exit_code = 0;
+    bool success = utils::run_command_secure_stream(curl_args, payload, stream_cb, &exit_code);
+    if (!success || exit_code != 0) {
+        std::cerr << "❌ Secure curl invocation failed with exit code: " << exit_code << std::endl;
+        return false;
+    }
+    
+    std::cout << std::endl;
     return true;
 }
 

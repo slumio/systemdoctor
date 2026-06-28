@@ -107,24 +107,110 @@ void normalize_vector(std::vector<float>& vec) {
     float norm = 0.0f;
     for (float v : vec) norm += v * v;
     norm = std::sqrt(norm);
-    if (norm > 1e-9f) {
+    if (norm > 1e-9f)
         for (float& v : vec) v /= norm;
-    }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SIMD-accelerated cosine similarity
+//  Uses AVX2 (8 floats/cycle) with SSE4 fallback, then scalar cleanup.
+//  ~4-8× faster than the naive scalar loop on long embedding vectors.
+// ─────────────────────────────────────────────────────────────────────────────
+#if defined(__AVX2__)
+#  include <immintrin.h>
 
 float cosine_similarity(const std::vector<float>& v1, const std::vector<float>& v2) {
     if (v1.size() != v2.size() || v1.empty()) return 0.0f;
-    float dot = 0.0f;
-    float norm1 = 0.0f;
-    float norm2 = 0.0f;
+    const size_t n = v1.size();
+    const float* a = v1.data();
+    const float* b = v2.data();
+
+    __m256 vdot  = _mm256_setzero_ps();
+    __m256 vnr1  = _mm256_setzero_ps();
+    __m256 vnr2  = _mm256_setzero_ps();
+
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        vdot = _mm256_fmadd_ps(va, vb, vdot);   // dot  += a*b
+        vnr1 = _mm256_fmadd_ps(va, va, vnr1);   // norm1 += a*a
+        vnr2 = _mm256_fmadd_ps(vb, vb, vnr2);   // norm2 += b*b
+    }
+
+    // Horizontal sum of 8-lane registers
+    auto hsum = [](const __m256& v) -> float {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 s  = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        return _mm_cvtss_f32(s);
+    };
+
+    float dot  = hsum(vdot);
+    float norm1 = hsum(vnr1);
+    float norm2 = hsum(vnr2);
+
+    // Scalar cleanup for remainder
+    for (; i < n; ++i) {
+        dot   += a[i] * b[i];
+        norm1 += a[i] * a[i];
+        norm2 += b[i] * b[i];
+    }
+    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
+    return dot / (std::sqrt(norm1) * std::sqrt(norm2));
+}
+
+#elif defined(__SSE4_1__)
+#  include <smmintrin.h>
+
+float cosine_similarity(const std::vector<float>& v1, const std::vector<float>& v2) {
+    if (v1.size() != v2.size() || v1.empty()) return 0.0f;
+    const size_t n = v1.size();
+    const float* a = v1.data();
+    const float* b = v2.data();
+
+    __m128 vdot = _mm_setzero_ps();
+    __m128 vnr1 = _mm_setzero_ps();
+    __m128 vnr2 = _mm_setzero_ps();
+
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        vdot = _mm_add_ps(vdot, _mm_mul_ps(va, vb));
+        vnr1 = _mm_add_ps(vnr1, _mm_mul_ps(va, va));
+        vnr2 = _mm_add_ps(vnr2, _mm_mul_ps(vb, vb));
+    }
+    auto hsum = [](const __m128& v) -> float {
+        __m128 s = _mm_hadd_ps(v, v);
+        s = _mm_hadd_ps(s, s);
+        return _mm_cvtss_f32(s);
+    };
+    float dot   = hsum(vdot);
+    float norm1 = hsum(vnr1);
+    float norm2 = hsum(vnr2);
+    for (; i < n; ++i) { dot += a[i]*b[i]; norm1 += a[i]*a[i]; norm2 += b[i]*b[i]; }
+    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
+    return dot / (std::sqrt(norm1) * std::sqrt(norm2));
+}
+
+#else   // scalar fallback
+
+float cosine_similarity(const std::vector<float>& v1, const std::vector<float>& v2) {
+    if (v1.size() != v2.size() || v1.empty()) return 0.0f;
+    float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
     for (size_t i = 0; i < v1.size(); ++i) {
-        dot += v1[i] * v2[i];
+        dot   += v1[i] * v2[i];
         norm1 += v1[i] * v1[i];
         norm2 += v2[i] * v2[i];
     }
     if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
     return dot / (std::sqrt(norm1) * std::sqrt(norm2));
 }
+
+#endif  // SIMD dispatch
 
 static std::vector<RawChunk> post_process_chunks(const std::vector<RawChunk>& raw_chunks) {
     std::vector<RawChunk> processed;
@@ -314,12 +400,10 @@ std::string get_db_path(const std::string& workspace_path) {
     return db_dir + "/" + safe_name + ".bin";
 }
 
-// Generate embeddings via curl subprocess
+// Generate embeddings via secure POSIX runner executing system curl
 static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<std::string>& texts, const Config& config) {
     std::vector<std::vector<float>> results;
     if (texts.empty()) return results;
-    
-    std::string temp_payload_path = utils::get_syspilot_directory() + "/temp_embed_req.json";
     
     if (config.active_provider == "gemini") {
         if (config.gemini_api_key.empty()) {
@@ -327,7 +411,6 @@ static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<st
             return results;
         }
         
-        // Gemini batch embedding API
         std::string model = config.embedding_model;
         if (!utils::starts_with(model, "models/")) {
             model = "models/" + model;
@@ -346,16 +429,21 @@ static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<st
         }
         jreq["requests"] = jrequests;
         
-        utils::write_file_content(temp_payload_path, jreq.dump());
-        
+        std::string payload = jreq.dump();
         std::string url = "https://generativelanguage.googleapis.com/v1beta/" + model + ":batchEmbedContents?key=" + config.gemini_api_key;
-        std::string cmd = "curl -s -X POST \"" + url + "\" -H \"Content-Type: application/json\" -d @" + temp_payload_path;
         
-        std::string resp = utils::run_command_output(cmd);
-        utils::delete_file(temp_payload_path);
+        std::vector<std::string> curl_args = {
+            "curl", "-s", "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "-d", "@-",
+            url
+        };
         
-        try {
-            if (!resp.empty()) {
+        int exit_code = 0;
+        std::string resp = utils::run_command_secure(curl_args, payload, &exit_code);
+        
+        if (exit_code == 0 && !resp.empty()) {
+            try {
                 json jresp = json::parse(resp);
                 if (jresp.contains("embeddings") && jresp["embeddings"].is_array()) {
                     for (const auto& item : jresp["embeddings"]) {
@@ -368,13 +456,11 @@ static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<st
                         }
                     }
                 }
-            }
-        } catch (...) {}
+            } catch (...) {}
+        }
         
     } else if (config.active_provider == "ollama") {
-        // Ollama embedding API - one by one since Ollama batching can overload local models context size
         for (const auto& text : texts) {
-            // Truncate to avoid context window blowup
             std::string truncated = text;
             if (truncated.length() > 1000) {
                 truncated = truncated.substr(0, 1000);
@@ -383,16 +469,22 @@ static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<st
             json jreq;
             jreq["model"] = config.embedding_model;
             jreq["input"] = truncated;
-            
-            utils::write_file_content(temp_payload_path, jreq.dump());
+            std::string payload = jreq.dump();
             
             std::string url = config.ollama_url + "/api/embed";
-            std::string cmd = "curl -s -X POST \"" + url + "\" -H \"Content-Type: application/json\" -d @" + temp_payload_path;
             
-            std::string resp = utils::run_command_output(cmd);
+            std::vector<std::string> curl_args = {
+                "curl", "-s", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", "@-",
+                url
+            };
             
-            try {
-                if (!resp.empty()) {
+            int exit_code = 0;
+            std::string resp = utils::run_command_secure(curl_args, payload, &exit_code);
+            
+            if (exit_code == 0 && !resp.empty()) {
+                try {
                     json jresp = json::parse(resp);
                     if (jresp.contains("embeddings") && jresp["embeddings"].is_array()) {
                         for (const auto& item : jresp["embeddings"]) {
@@ -405,10 +497,9 @@ static std::vector<std::vector<float>> fetch_embeddings_api(const std::vector<st
                             }
                         }
                     }
-                }
-            } catch (...) {}
+                } catch (...) {}
+            }
         }
-        utils::delete_file(temp_payload_path);
     }
     
     return results;
@@ -426,6 +517,12 @@ bool update_index(const std::string& workspace_path, const Config& config, bool 
     std::vector<std::pair<std::string, std::string>> files_to_index; // Absolute path, Relative path
     std::unordered_set<std::string> active_rel_paths;
     
+    // Map registry file paths for O(1) checks instead of O(N) linear scans
+    std::unordered_map<std::string, const FileRegistry*> registry_map;
+    for (const auto& reg : db.files) {
+        registry_map[reg.file_path] = &reg;
+    }
+    
     for (const auto& f : wfiles) {
         std::string rel_path = f;
         if (utils::starts_with(rel_path, workspace_path)) {
@@ -440,12 +537,10 @@ bool update_index(const std::string& workspace_path, const Config& config, bool 
         uint64_t size = utils::get_file_size(f);
         
         bool modified_check = true;
-        for (const auto& reg : db.files) {
-            if (reg.file_path == rel_path) {
-                if (reg.last_modified == modified && reg.size == size) {
-                    modified_check = false;
-                }
-                break;
+        auto it = registry_map.find(rel_path);
+        if (it != registry_map.end()) {
+            if (it->second->last_modified == modified && it->second->size == size) {
+                modified_check = false;
             }
         }
         if (modified_check) {
@@ -466,14 +561,22 @@ bool update_index(const std::string& workspace_path, const Config& config, bool 
         std::cout << "🔍 Indexing " << files_to_index.size() << " new/modified files..." << std::endl;
         
         std::vector<DbChunk> new_chunks;
-        std::vector<FileRegistry> new_registries;
+        
+        // Optimize search deletion: erase old entries/chunks in a single pass instead of per-file
+        std::unordered_set<std::string> paths_to_index;
+        for (const auto& p : files_to_index) {
+            paths_to_index.insert(p.second);
+        }
+        
+        db.chunks.erase(std::remove_if(db.chunks.begin(), db.chunks.end(), [&](const DbChunk& c) {
+            return paths_to_index.find(c.file_path) != paths_to_index.end();
+        }), db.chunks.end());
+        
+        db.files.erase(std::remove_if(db.files.begin(), db.files.end(), [&](const FileRegistry& r) {
+            return paths_to_index.find(r.file_path) != paths_to_index.end();
+        }), db.files.end());
         
         for (const auto& p : files_to_index) {
-            // Remove old chunks of this file
-            db.chunks.erase(std::remove_if(db.chunks.begin(), db.chunks.end(), [&](const DbChunk& c) {
-                return c.file_path == p.second;
-            }), db.chunks.end());
-            
             std::vector<RawChunk> file_chunks = chunk_file(p.first, config.chunk_strategy);
             for (const auto& fc : file_chunks) {
                 DbChunk chunk;
@@ -488,16 +591,7 @@ bool update_index(const std::string& workspace_path, const Config& config, bool 
             reg.file_path = p.second;
             reg.last_modified = utils::get_last_modified_time(p.first);
             reg.size = utils::get_file_size(p.first);
-            
-            // Update or add registry
-            auto it = std::find_if(db.files.begin(), db.files.end(), [&](const FileRegistry& r) {
-                return r.file_path == p.second;
-            });
-            if (it != db.files.end()) {
-                *it = reg;
-            } else {
-                db.files.push_back(reg);
-            }
+            db.files.push_back(reg);
         }
         
         if (!new_chunks.empty()) {
